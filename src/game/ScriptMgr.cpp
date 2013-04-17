@@ -77,6 +77,7 @@ ScriptMgr::ScriptMgr() :
     m_pOnEffectDummyCreature(NULL),
     m_pOnEffectDummyGO(NULL),
     m_pOnEffectDummyItem(NULL),
+    m_pOnEffectScriptEffectCreature(NULL),
     m_pOnAuraDummy(NULL)
 {
 }
@@ -458,6 +459,11 @@ void ScriptMgr::LoadScripts(ScriptMapMapName& scripts, const char* tablename)
                                     tablename, tmp.playSound.soundId, tmp.id);
                     continue;
                 }
+                // bitmask: 0/1=target-player, 0/2=with distance dependent, 0/4=map wide, 0/8=zone wide
+                if (tmp.playSound.flags & ~(1 | 2 | 4 | 8))
+                    sLog.outErrorDb("Table `%s` using unsupported sound flags (datalong2: %u) in SCRIPT_COMMAND_PLAY_SOUND for script id %u, unsupported flags will be ignored", tablename, tmp.playSound.flags, tmp.id);
+                if ((tmp.playSound.flags & (1 | 2)) > 0 && (tmp.playSound.flags & (4 | 8)) > 0)
+                    sLog.outErrorDb("Table `%s` uses sound flags (datalong2: %u) in SCRIPT_COMMAND_PLAY_SOUND for script id %u, combining (1|2) with (4|8) makes no sense", tablename, tmp.playSound.flags, tmp.id);
                 break;
             }
             case SCRIPT_COMMAND_CREATE_ITEM:                // 17
@@ -625,6 +631,22 @@ void ScriptMgr::LoadScripts(ScriptMapMapName& scripts, const char* tablename)
             }
             case SCRIPT_COMMAND_PAUSE_WAYPOINTS:            // 32
                 break;
+            case SCRIPT_COMMAND_RESERVED_1:                 // 33
+                break;
+            case SCRIPT_COMMAND_TERMINATE_COND:             // 34
+            {
+                if (!sConditionStorage.LookupEntry<PlayerCondition>(tmp.terminateCond.conditionId))
+                {
+                    sLog.outErrorDb("Table `%s` has datalong = %u in SCRIPT_COMMAND_TERMINATE_COND for script id %u, but this condition_id does not exist.", tablename, tmp.terminateCond.conditionId, tmp.id);
+                    continue;
+                }
+                if (tmp.terminateCond.failQuest && !sObjectMgr.GetQuestTemplate(tmp.terminateCond.failQuest))
+                {
+                    sLog.outErrorDb("Table `%s` has datalong2 = %u in SCRIPT_COMMAND_TERMINATE_COND for script id %u, but this questId does not exist.", tablename, tmp.terminateCond.failQuest, tmp.id);
+                    continue;
+                }
+                break;
+            }
             default:
             {
                 sLog.outErrorDb("Table `%s` unknown command %u, skipping.", tablename, tmp.command);
@@ -763,7 +785,7 @@ void ScriptMgr::LoadCreatureDeathScripts()
     LoadScripts(sCreatureDeathScripts, "dbscripts_on_creature_death");
 
     // check ids
-    for(ScriptMapMap::const_iterator itr = sCreatureDeathScripts.second.begin(); itr != sCreatureDeathScripts.second.end(); ++itr)
+    for (ScriptMapMap::const_iterator itr = sCreatureDeathScripts.second.begin(); itr != sCreatureDeathScripts.second.end(); ++itr)
     {
         if (!sObjectMgr.GetCreatureTemplate(itr->first))
             sLog.outErrorDb("Table `dbscripts_on_creature_death` has not existing creature (Entry: %u) as script id", itr->first);
@@ -1378,7 +1400,7 @@ bool ScriptAction::HandleScriptStep()
                 break;
             }
 
-            // bitmask: 0/1=anyone/target, 0/2=with distance dependent
+            // bitmask: 0/1=target-player, 0/2=with distance dependent, 0/4=map wide, 0/8=zone wide
             Player* pSoundTarget = NULL;
             if (m_script->playSound.flags & 1)
             {
@@ -1387,9 +1409,10 @@ bool ScriptAction::HandleScriptStep()
                     break;
             }
 
-            // bitmask: 0/1=anyone/target, 0/2=with distance dependent
             if (m_script->playSound.flags & 2)
                 pSource->PlayDistanceSound(m_script->playSound.soundId, pSoundTarget);
+            else if (m_script->playSound.flags & (4 | 8))
+                m_map->PlayDirectSoundToMap(m_script->playSound.soundId, m_script->playSound.flags & 8 ? pSource->GetZoneId() : 0);
             else
                 pSource->PlayDirectSound(m_script->playSound.soundId, pSoundTarget);
 
@@ -1640,12 +1663,12 @@ bool ScriptAction::HandleScriptStep()
 
             if (result)                                    // Terminate further steps of this script
             {
-                 if (m_script->textId[0] && !LogIfNotCreature(pSource))
-                 {
-                     Creature* cSource = static_cast<Creature*>(pSource);
-                     if (cSource->GetMotionMaster()->GetCurrentMovementGeneratorType() == WAYPOINT_MOTION_TYPE)
-                         (static_cast<WaypointMovementGenerator<Creature>* >(cSource->GetMotionMaster()->top()))->AddToWaypointPauseTime(m_script->textId[0]);
-                 }
+                if (m_script->textId[0] && !LogIfNotCreature(pSource))
+                {
+                    Creature* cSource = static_cast<Creature*>(pSource);
+                    if (cSource->GetMotionMaster()->GetCurrentMovementGeneratorType() == WAYPOINT_MOTION_TYPE)
+                        (static_cast<WaypointMovementGenerator<Creature>* >(cSource->GetMotionMaster()->top()))->AddToWaypointPauseTime(m_script->textId[0]);
+                }
 
                 return true;
             }
@@ -1661,6 +1684,50 @@ bool ScriptAction::HandleScriptStep()
             else
                 ((Creature*)pSource)->clearUnitState(UNIT_STAT_WAYPOINT_PAUSED);
             break;
+        }
+        case SCRIPT_COMMAND_RESERVED_1:                     // 33
+        {
+            sLog.outError(" DB-SCRIPTS: Process table `%s` id %u, command %u not supported.", m_table, m_script->id, m_script->command);
+            break;
+        }
+        case SCRIPT_COMMAND_TERMINATE_COND:
+        {
+            Player* player = NULL;
+            WorldObject* second = pSource;
+            // First case: target is player
+            if (pTarget && pTarget->GetTypeId() == TYPEID_PLAYER)
+                player = static_cast<Player*>(pTarget);
+            // Second case: source is player
+            else if (pSource && pSource->GetTypeId() == TYPEID_PLAYER)
+            {
+                player = static_cast<Player*>(pSource);
+                second = pTarget;
+            }
+
+            bool terminateResult;
+            if (m_script->data_flags & SCRIPT_FLAG_COMMAND_ADDITIONAL)
+                terminateResult = !sObjectMgr.IsPlayerMeetToCondition(m_script->terminateCond.conditionId, player, m_map, second, CONDITION_FROM_DBSCRIPTS);
+            else
+                terminateResult = sObjectMgr.IsPlayerMeetToCondition(m_script->terminateCond.conditionId, player, m_map, second, CONDITION_FROM_DBSCRIPTS);
+
+            if (terminateResult && m_script->terminateCond.failQuest && player)
+            {
+                if (Group* group = player->GetGroup())
+                {
+                    for (GroupReference* groupRef = group->GetFirstMember(); groupRef != NULL; groupRef = groupRef->next())
+                    {
+                        Player* member = groupRef->getSource();
+                        if (member->GetQuestStatus(m_script->terminateCond.failQuest) == QUEST_STATUS_INCOMPLETE)
+                            member->FailQuest(m_script->terminateCond.failQuest);
+                    }
+                }
+                else
+                {
+                    if (player->GetQuestStatus(m_script->terminateCond.failQuest) == QUEST_STATUS_INCOMPLETE)
+                        player->FailQuest(m_script->terminateCond.failQuest);
+                }
+            }
+            return terminateResult;
         }
         default:
             sLog.outError(" DB-SCRIPTS: Process table `%s` id %u, command %u unknown command used.", m_table, m_script->id, m_script->command);
@@ -1970,6 +2037,11 @@ bool ScriptMgr::OnEffectDummy(Unit* pCaster, uint32 spellId, SpellEffectIndex ef
     return m_pOnEffectDummyItem != NULL && m_pOnEffectDummyItem(pCaster, spellId, effIndex, pTarget);
 }
 
+bool ScriptMgr::OnEffectScriptEffect(Unit* pCaster, uint32 spellId, SpellEffectIndex effIndex, Creature* pTarget)
+{
+    return m_pOnEffectScriptEffectCreature != NULL && m_pOnEffectScriptEffectCreature(pCaster, spellId, effIndex, pTarget);
+}
+
 bool ScriptMgr::OnAuraDummy(Aura const* pAura, bool apply)
 {
     return m_pOnAuraDummy != NULL && m_pOnAuraDummy(pAura, apply);
@@ -2029,6 +2101,7 @@ ScriptLoadResult ScriptMgr::LoadScriptLibrary(const char* libName)
     GET_SCRIPT_HOOK_PTR(m_pOnEffectDummyCreature,      "EffectDummyCreature");
     GET_SCRIPT_HOOK_PTR(m_pOnEffectDummyGO,            "EffectDummyGameObject");
     GET_SCRIPT_HOOK_PTR(m_pOnEffectDummyItem,          "EffectDummyItem");
+    GET_SCRIPT_HOOK_PTR(m_pOnEffectScriptEffectCreature, "EffectScriptEffectCreature");
     GET_SCRIPT_HOOK_PTR(m_pOnAuraDummy,                "AuraDummy");
 
 #   undef GET_SCRIPT_HOOK_PTR
@@ -2082,6 +2155,7 @@ void ScriptMgr::UnloadScriptLibrary()
     m_pOnEffectDummyCreature    = NULL;
     m_pOnEffectDummyGO          = NULL;
     m_pOnEffectDummyItem        = NULL;
+    m_pOnEffectScriptEffectCreature = NULL;
     m_pOnAuraDummy              = NULL;
 }
 
